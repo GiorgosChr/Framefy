@@ -1,9 +1,14 @@
 """Offline self-check: python test_framefy.py"""
+import http.server
 import io
+import json
 import os
 import pathlib
 import re
 import tempfile
+import threading
+import urllib.error
+import urllib.request
 
 from PIL import Image
 
@@ -45,5 +50,27 @@ buf = io.BytesIO()
 framefy.save(framefy.render({**album, "tracks": []}, covers[0]), buf, "pdf")
 w, h = map(float, re.search(rb"/MediaBox \[ *0 0 ([\d.]+) ([\d.]+)", buf.getvalue()).groups())
 assert abs(w - 595.3) < 1 and abs(h - 841.9) < 1, (w, h)  # A4 in points
+
+entity = {"id": ID, "name": "An Album", "subtitle": "Some Artist",
+          "trackList": [{"title": "One", "duration": 60_000}, {"title": "Two", "duration": 61_000}],
+          "visualIdentity": {"image": [{"url": "small", "maxWidth": 64}, {"url": "big", "maxWidth": 640}]}}
+embed = ('<script id="__NEXT_DATA__" type="application/json">%s</script>'
+         % json.dumps({"props": {"pageProps": {"state": {"data": {"entity": entity}}}}}))
+page = ('<meta name="music:musician" content="https://open.spotify.com/artist/%s"/>'
+        '<meta name="music:release_date" content="2016-01-29"/>' % ("a" * 22))
+assert framefy.parse_public(embed, page) == {
+    "id": ID, "title": "An Album", "artist": "Some Artist", "artist_id": "a" * 22, "date": "Jan 29, 2016",
+    "runtime": "2min 1s", "tracks": ["One", "Two"], "cover_url": "big"}
+
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), framefy.UI)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+base = f"http://127.0.0.1:{srv.server_port}"
+assert b"<title>Framefy</title>" in urllib.request.urlopen(base + "/").read()
+try:
+    urllib.request.urlopen(base + "/album?id=not-an-album")
+    raise AssertionError("bad id accepted")
+except urllib.error.HTTPError as e:
+    assert e.code == 400 and "error" in json.loads(e.read())
+srv.shutdown()
 
 print("ok")
