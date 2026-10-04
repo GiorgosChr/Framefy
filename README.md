@@ -7,10 +7,9 @@ Makes a printable poster from a Spotify album.
 ## Setup
 
     pip install pillow
-    export SPOTIFY_CLIENT_ID=...
-    export SPOTIFY_CLIENT_SECRET=...
+    cp .env.example .env
 
-The two values come from an app at https://developer.spotify.com/dashboard.
+Then edit `.env` and replace the two placeholders with the client ID and secret of an app from https://developer.spotify.com/dashboard. `.env` is not tracked by git.
 
 ## Use
 

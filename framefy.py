@@ -31,10 +31,21 @@ def fetch(url, headers=None, data=None):
         return r.read()
 
 
+def load_env(path=Path(__file__).parent / ".env"):
+    """Read KEY=value lines into the environment; variables already set win."""
+    if not path.exists():
+        return
+    for line in path.read_text().splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            key, value = line.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
 def token():
+    load_env()
     cid, secret = os.environ.get("SPOTIFY_CLIENT_ID"), os.environ.get("SPOTIFY_CLIENT_SECRET")
     if not (cid and secret):
-        sys.exit("Set SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET (see README).")
+        sys.exit("Copy .env.example to .env and fill in your Spotify credentials (see README).")
     auth = base64.b64encode(f"{cid}:{secret}".encode()).decode()
     body = fetch("https://accounts.spotify.com/api/token",
                  {"Authorization": f"Basic {auth}"}, b"grant_type=client_credentials")

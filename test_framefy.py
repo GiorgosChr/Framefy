@@ -1,6 +1,9 @@
 """Offline self-check: python test_framefy.py"""
 import io
+import os
+import pathlib
 import re
+import tempfile
 
 from PIL import Image
 
@@ -17,6 +20,12 @@ assert framefy.fmt_runtime(4_208_000) == "1h 10min 8s"
 assert framefy.fmt_date("2014-01-28") == "Jan 28, 2014"
 assert framefy.fmt_date("2014-01") == "Jan 2014"
 assert framefy.fmt_date("2014") == "2014"
+
+env = pathlib.Path(tempfile.mkdtemp()) / ".env"
+env.write_text("# comment\nFRAMEFY_TEST_A = 'abc'\nFRAMEFY_TEST_B=x=y\n")
+os.environ["FRAMEFY_TEST_B"] = "kept"
+framefy.load_env(env)
+assert os.environ["FRAMEFY_TEST_A"] == "abc" and os.environ["FRAMEFY_TEST_B"] == "kept"
 
 g = Image.linear_gradient("L")
 covers = [Image.merge("RGB", (g, g.rotate(90), g.rotate(180))), Image.new("RGB", (640, 640), "white")]
