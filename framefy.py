@@ -10,6 +10,7 @@ import json
 import os
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -178,7 +179,7 @@ def load_code(album_id):
         print("warning: could not fetch the Spotify code, leaving it out", file=sys.stderr)
 
 
-@functools.lru_cache(maxsize=32)
+@functools.lru_cache(maxsize=8)  # a cover is ~12 MB in memory
 def assets(album_id):
     """Album details, cover and scan code: from the API with a key, from public pages without."""
     tok, album = token(), None
@@ -193,7 +194,7 @@ def assets(album_id):
     return album, load_image(album["cover_url"]), load_code(album_id)
 
 
-@functools.lru_cache(maxsize=32)
+@functools.lru_cache(maxsize=8)
 def artist_image(artist_id):
     tok = token()
     if tok:
@@ -371,7 +372,11 @@ def valid_id(s):
     return s
 
 
+RENDERING = threading.Lock()  # one poster at a time: an A3 render needs ~150 MB
+
+
 class UI(http.server.BaseHTTPRequestHandler):
+    # ponytail: stdlib server with no rate limiting, fine for a hobby site; move to gunicorn if it gets real traffic
     def reply(self, body, ctype, status=200, filename=None):
         self.send_response(status)
         self.send_header("Content-Type", ctype)
@@ -413,14 +418,18 @@ class UI(http.server.BaseHTTPRequestHandler):
                 if size not in SIZES or orientation not in ORIENTATIONS or fmt not in FORMATS:
                     raise ValueError("Unknown option.")
                 preview = "preview" in q  # same proportions at any size, so previews are always A4
-                album, img = poster(valid_id(q.get("id")), "A4" if preview else size, orientation, "artist" in q)
                 buf = io.BytesIO()
+                with RENDERING:
+                    album, img = poster(valid_id(q.get("id")), "A4" if preview else size, orientation, "artist" in q)
+                    if preview:
+                        img.thumbnail((1400, 1400))
+                        img.save(buf, "PNG")
+                    else:
+                        save(img, buf, fmt)
+                    del img
                 if preview:
-                    img.thumbnail((1400, 1400))
-                    img.save(buf, "PNG")
                     self.reply(buf.getvalue(), "image/png")
                 else:
-                    save(img, buf, fmt)
                     self.reply(buf.getvalue(), "application/pdf" if fmt == "pdf" else "image/png",
                                filename=file_name(album, fmt))
             else:
@@ -431,14 +440,19 @@ class UI(http.server.BaseHTTPRequestHandler):
             self.json({"error": str(e)}, 400)
 
 
-def serve(port=8765):
+def serve():
+    hosted = "PORT" in os.environ  # set by hosts such as Render: listen publicly and do not open a browser
+    host, port = ("0.0.0.0", int(os.environ["PORT"])) if hosted else ("127.0.0.1", 8765)
     try:
-        srv = http.server.ThreadingHTTPServer(("127.0.0.1", port), UI)
+        srv = http.server.ThreadingHTTPServer((host, port), UI)
     except OSError:  # port taken: let the system pick one
-        srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), UI)
-    url = f"http://127.0.0.1:{srv.server_port}"
-    print(f"Framefy is running at {url} (Ctrl+C to stop)")
-    webbrowser.open(url)
+        if hosted:
+            raise
+        srv = http.server.ThreadingHTTPServer((host, 0), UI)
+    url = f"http://{host}:{srv.server_port}"
+    print(f"Framefy is running at {url} (Ctrl+C to stop)", flush=True)
+    if not hosted:
+        webbrowser.open(url)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
