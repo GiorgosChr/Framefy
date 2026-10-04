@@ -20,10 +20,23 @@ From the terminal instead:
 
 | Option | Values | Default |
 | --- | --- | --- |
-| `--size` | `A4`, `A3` | `A4` |
+| `--size` | `A5`, `A4`, `A3`, `A2`, `LETTER`, `50X70` | `A4` |
 | `--orientation` | `portrait`, `landscape` | `portrait` |
 | `--format` | `png`, `pdf` | `png` |
-| `--artist-image` | flag: adds the artist's profile picture next to their name | off |
+| `--layout` | `standard`, `cover-right` (landscape), `minimal` (cover, title, artist only) | `standard` |
+| `--cover` | `fade`, `soft`, `sharp`, `framed` | `fade` |
+| `--cover-image` | your own image file instead of the album cover | album cover |
+| `--bg`, `--text` | colour such as `#ecebe6` | from the cover |
+| `--font` | `montserrat`, `playfair` | `montserrat` |
+| `--weight` | `light`, `bold`, `black` | `bold` |
+| `--hide` | comma-separated: `tracks`, `date`, `runtime`, `code`, `strip` | nothing |
+| `--artist-image` | flag: artist's profile picture next to their name | off |
+| `--durations` | flag: each track's length | off |
+| `--clean-titles` | flag: drops `(feat. …)` and remaster notes from track names | off |
+| `--columns` | `1` to `4` tracklist columns | automatic |
+| `--title`, `--artist` | replacement text | from Spotify |
+| `--caption` | small line at the bottom | none |
+| `--bleed` | `0` to `10` mm extra margin for print shops | `0` |
 | `-o` | output file | `<artist> - <album>.<format>` |
 
 ## Searching by name (optional)

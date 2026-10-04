@@ -9,6 +9,7 @@ import io
 import json
 import os
 import re
+import secrets
 import sys
 import threading
 import time
@@ -22,9 +23,16 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 API = "https://api.spotify.com/v1"
 ALBUM_RE = re.compile(r"(?:open\.spotify\.com/(?:intl-\w+/)?album/|spotify:album:)([A-Za-z0-9]{22})")
-FONT = str(Path(__file__).parent / "fonts" / "Montserrat.ttf")
+VERSION = "1.1.0"
+FONT_DIR = Path(__file__).parent / "fonts"
+FONTS = {"montserrat": "Montserrat.ttf", "playfair": "PlayfairDisplay.ttf"}
+WEIGHTS = {"light": 500, "bold": 700, "black": 900}
 DPI = 300
-SIZES = {"A4": (2480, 3508), "A3": (3508, 4961)}  # short, long side in px at 300 dpi
+SIZES = {"A5": (1748, 2480), "A4": (2480, 3508), "A3": (3508, 4961), "A2": (4961, 7016),
+         "LETTER": (2550, 3300), "50X70": (5906, 8268)}  # short, long side in px at 300 dpi
+PARTS = ("tracks", "date", "runtime", "code", "strip")  # what --hide can leave out
+FADES = {"fade": 0.17, "soft": 0.4, "sharp": 0, "framed": None}  # share of the cover that fades out
+LAYOUTS = ("standard", "cover-right", "minimal")
 ORIENTATIONS = ("portrait", "landscape")
 FORMATS = ("png", "pdf")
 UA = {"User-Agent": "Mozilla/5.0"}  # Spotify's public pages refuse the default urllib agent
@@ -136,6 +144,7 @@ def load_album(album_id, tok):
         "date": fmt_date(a["release_date"]),
         "runtime": fmt_runtime(sum(t["duration_ms"] for t in tracks)),
         "tracks": [t["name"] for t in tracks],
+        "durations": [t["duration_ms"] for t in tracks],
         "cover_url": a["images"][0]["url"],
     }
 
@@ -157,6 +166,7 @@ def parse_public(embed_html, album_html):
         "date": fmt_date(date.group(1)) if date else "",
         "runtime": fmt_runtime(sum(t["duration"] for t in e["trackList"])),
         "tracks": [t["title"] for t in e["trackList"]],
+        "durations": [t["duration"] for t in e["trackList"]],
         "cover_url": max(e["visualIdentity"]["image"], key=lambda i: i["maxWidth"])["url"],
     }
 
@@ -207,9 +217,9 @@ def artist_image(artist_id):
 
 # --- Rendering ---
 
-@functools.lru_cache(maxsize=None)
-def font(size, weight):
-    f = ImageFont.truetype(FONT, max(1, round(size)))
+@functools.lru_cache(maxsize=256)
+def font(size, weight, name="montserrat"):
+    f = ImageFont.truetype(str(FONT_DIR / FONTS[name]), max(1, round(size)))
     f.set_variation_by_axes([weight])
     return f
 
@@ -228,9 +238,19 @@ def mix(a, b, t):
     return tuple(round(x + (y - x) * t) for x, y in zip(a, b))
 
 
+def readable(colour, bg):
+    """colour pushed towards black or white until it can be read on bg."""
+    target = (0, 0, 0) if lum(bg) > 0.18 else (255, 255, 255)
+    for t in range(21):
+        out = mix(colour, target, t / 20)
+        if contrast(out, bg) >= 4.5:
+            break
+    return out
+
+
 def palette(cover):
-    """Background, text and three strip colours taken from the cover."""
-    # ponytail: simple heuristic, no taste involved; add --bg/--text overrides if it picks badly
+    """Background, text, three strip colours and the whole palette, taken from the cover."""
+    # ponytail: simple heuristic, no taste involved; the bg/fg options override it
     raw = cover.convert("RGB").resize((64, 64)).tobytes()
     px = list(zip(raw[0::3], raw[1::3], raw[2::3]))
     px = [p for p in px if min(p) <= 250] or px  # near-white would otherwise win on most covers
@@ -240,15 +260,62 @@ def palette(cover):
     pal = q.getpalette()
     cols = [tuple(pal[i * 3:i * 3 + 3]) for _, i in sorted(q.getcolors(), reverse=True)]
     bg = cols[0]
-    # text: the most colourful palette entry, pushed towards black or white until readable on bg
-    base = max(cols, key=lambda c: max(c) - min(c))
-    target = (0, 0, 0) if lum(bg) > 0.18 else (255, 255, 255)
-    for t in range(21):
-        fg = mix(base, target, t / 20)
-        if contrast(fg, bg) >= 4.5:
-            break
+    fg = readable(max(cols, key=lambda c: max(c) - min(c)), bg)  # text: the most colourful palette entry
     strip = sorted(cols[1:], key=lambda c: contrast(c, bg), reverse=True)  # ones that show up on bg first
-    return bg, fg, (strip + [fg] * 3)[:3]
+    return bg, fg, (strip + [fg] * 3)[:3], cols
+
+
+def options(raw):
+    """Poster options, validated, from the strings of a query string or the command line."""
+    def choice(key, allowed, default):
+        v = raw.get(key) or default
+        if v not in allowed:
+            raise ValueError(f"Unknown {key}: {v}")
+        return v
+
+    def colour(key):
+        v = (raw.get(key) or "").lstrip("#")
+        if v and not re.fullmatch(r"[0-9a-fA-F]{6}", v):
+            raise ValueError(f"{key} must be a colour like #1a2b3c")
+        return tuple(int(v[i:i + 2], 16) for i in (0, 2, 4)) if v else None
+
+    hide = [p for p in (raw.get("hide") or "").split(",") if p]
+    if set(hide) - set(PARTS):
+        raise ValueError(f"hide takes: {', '.join(PARTS)}")
+    return {
+        "bg": colour("bg"), "fg": colour("fg"), "hide": hide,
+        "title": (raw.get("title") or "")[:200], "artist": (raw.get("artist") or "")[:200],
+        "caption": (raw.get("caption") or "")[:200],
+        "clean": bool(raw.get("clean")), "durations": bool(raw.get("durations")),
+        "columns": int(choice("columns", ("0", "1", "2", "3", "4"), "0")),
+        "bleed": int(choice("bleed", tuple(map(str, range(11))), "0")),
+        "cover": choice("cover", FADES, "fade"), "layout": choice("layout", LAYOUTS, "standard"),
+        "font": choice("font", FONTS, "montserrat"), "weight": choice("weight", WEIGHTS, "bold"),
+    }
+
+
+CLEAN_RE = re.compile(
+    r"\s*[(\[](?:feat|ft|with)\b[^)\]]*[)\]]"  # (feat. Someone)
+    r"|\s*[(\[][^)\]]*\b(?:remaster(?:ed)?|version|edit|bonus track)\b[^)\]]*[)\]]"  # (2011 Remaster)
+    r"|\s+-\s+[^-]*\b(?:remaster(?:ed)?|version|edit|bonus track)\b.*$", re.I)  # - Remastered 2011
+
+
+def clean(name):
+    return CLEAN_RE.sub("", name).strip() or name
+
+
+def own_cover(source):
+    """Someone's own image (path or file object) as a square cover."""
+    try:
+        img = Image.open(source)
+        if img.width * img.height > 40_000_000:
+            raise ValueError
+        img = ImageOps.exif_transpose(img).convert("RGB")
+    except Exception:
+        raise ValueError("That file is not an image Framefy can use (40 megapixels at most).") from None
+    img = ImageOps.fit(img, (min(img.size),) * 2)
+    img.thumbnail((2000, 2000))
+    return img
 
 
 def wrap(d, text, f, max_w):
@@ -262,59 +329,95 @@ def wrap(d, text, f, max_w):
     return lines
 
 
-def fit(d, text, weight, max_size, max_w, max_lines, u):
-    """Largest size (in layout units) at which text fits max_w within max_lines."""
+def fit(d, text, F, max_size, max_w, max_lines):
+    """Largest size (in layout units) at which text fits max_w within max_lines; F makes a font of a size."""
     for size in range(max_size, 19, -1):
-        f = font(size * u, weight)
+        f = F(size)
         lines = wrap(d, text, f, max_w)
         if len(lines) <= max_lines and all(d.textlength(l, font=f) <= max_w for l in lines):
             break
     return f, size, lines
 
 
-def draw_tracks(d, tracks, x, y, max_w, bottom, u, fill):
+def draw_tracks(d, items, F, x, y, max_w, bottom, u, fill, muted, columns=0):
+    """items are (name, duration) pairs; columns=0 uses as many as the height needs."""
     # ponytail: one very long track name shrinks the whole list; truncate with an ellipsis if that looks bad
-    names = [f"{i}. {t}" for i, t in enumerate(tracks, 1)]
+    if not items:
+        return
     for size in range(27, 9, -1):
-        f, pitch = font(size * u, 700), size * 37 / 27 * u
-        rows = max(1, int((bottom - y) / pitch) + 1)
-        cols = [names[i:i + rows] for i in range(0, len(names), rows)]
-        widths = [max(d.textlength(n, font=f) for n in c) for c in cols]
-        if sum(widths) + 30 * u * (len(cols) - 1) <= max_w:
+        f, pitch = F(size), size * 37 / 27 * u
+        fit_rows = max(1, int((bottom - y) / pitch) + 1)
+        rows = -(-len(items) // columns) if columns else fit_rows
+        cols = [items[i:i + rows] for i in range(0, len(items), rows)]
+        widths = [max(d.textlength(n + ("   " + t if t else ""), font=f) for n, t in c) for c in cols]
+        if rows <= fit_rows and sum(widths) + 30 * u * (len(cols) - 1) <= max_w:
             break
     for c, w in zip(cols, widths):
-        for r, n in enumerate(c):
+        for r, (n, t) in enumerate(c):
             d.text((x, y + r * pitch), n, fill, f, anchor="ls")
+            d.text((x + d.textlength(n + "   ", font=f), y + r * pitch), t, muted, f, anchor="ls")
         x += w + 30 * u
 
 
-def render(album, cover, code=None, size="A4", orientation="portrait", artist_img=None):
-    """Layout numbers are in units of short side / 1414, measured off the reference posters."""
-    short, long = SIZES[size]
+def add_bleed(img, px):
+    """Extend the page by px on every side, stretching the edge pixels outwards for the print shop to trim."""
+    w, h = img.size
+    out = ImageOps.expand(img, px, img.getpixel((0, h - 1)))
+    for box, pos, size in (((0, 0, w, 1), (px, 0), (w, px)), ((0, h - 1, w, h), (px, h + px), (w, px)),
+                           ((0, 0, 1, h), (0, px), (px, h)), ((w - 1, 0, w, h), (w + px, px), (px, h))):
+        out.paste(img.crop(box).resize(size), pos)
+    return out
+
+
+def render(album, art, code=None, size="A4", orientation="portrait", artist_img=None, scale=1, **opts):
+    """Layout numbers are in units of short side / 1414, measured off the A4 reference posters (2000 units long)."""
+    o = {**options({}), **opts}
+    short, long = (round(v * scale) for v in SIZES[size])
     land = orientation == "landscape"
     W, H = (long, short) if land else (short, long)
     u = short / 1414
-    bg, fg, strip = palette(cover)
+    off = long / u - 2000  # paper squarer than A-series is shorter: the text block and fade move up by this
+    hide = set(PARTS) if o["layout"] == "minimal" else set(o["hide"])
+    flip = land and o["layout"] == "cover-right"
+    bg, fg, strip, _ = palette(art)
+    bg = o["bg"] or bg
+    fg = o["fg"] or readable(fg, bg)  # keeps the automatic text legible on a chosen background
     muted = mix(fg, bg, 0.35)
+
+    def F(size):
+        return font(size * u, WEIGHTS[o["weight"]], o["font"])
+
     img = Image.new("RGB", (W, H), bg)
     d = ImageDraw.Draw(img)
+    m = round(92 * u)  # page margin
 
-    # square cover on the short side, fading into the background towards the text
-    start, end = (0.70, 0.88) if land else (0.75, 0.92)
-    ramp = [min(1, max(0, (end - i / short) / (end - start))) for i in range(short)]
-    mask = Image.new("L", (1, short))
-    mask.putdata([round(255 * t * t * (3 - 2 * t)) for t in ramp])
-    mask = mask.resize((short, short))
+    art = art.convert("RGB")
+    if o["cover"] == "framed":  # the whole cover inside the margins, no fade
+        side = round((1230 + min(0, off)) * u)
+        pos = (W - m - side if flip else m, (H - side) // 2) if land else ((W - side) // 2, m)
+        img.paste(art.resize((side, side), Image.Resampling.LANCZOS), pos)
+    else:  # square cover on the short side, fading into the background towards the text
+        end, width = (0.88 if land else 0.92) + off / 1414, FADES[o["cover"]]
+        ramp = [min(1, max(0, (end - i / short) / width)) if width else float(i / short < end) for i in range(short)]
+        mask = Image.new("L", (1, short))
+        mask.putdata([round(255 * t * t * (3 - 2 * t)) for t in ramp])
+        mask = mask.resize((short, short))
+        if land:
+            mask = mask.transpose(Image.Transpose.TRANSPOSE)
+        if flip:
+            mask = mask.transpose(Image.Transpose.FLIP_LEFT_RIGHT)
+        img.paste(art.resize((short, short), Image.Resampling.LANCZOS), (W - short if flip else 0, 0), mask)
+
+    x0 = (1360 + off) * u if land and not flip else m
+    max_w = 548 * u if land else W - 2 * m
+    foot = (1188 if land else 1886 + off) * u  # baseline of the "Release date" label
+
+    f, s, lines = fit(d, o["title"] or album["title"], F, 113, max_w, 3 if land else 1)
+    block = (0.72 + 1.1 * (len(lines) - 1)) * s  # top of the first line to the last baseline
     if land:
-        mask = mask.transpose(Image.Transpose.TRANSPOSE)
-    img.paste(cover.convert("RGB").resize((short, short), Image.Resampling.LANCZOS), (0, 0), mask)
-
-    x0 = (1360 if land else 92) * u
-    max_w = W - 92 * u - x0
-    foot = (1188 if land else 1886) * u  # baseline of the "Release date" label
-
-    f, s, lines = fit(d, album["title"], 700, 113, max_w, 3 if land else 1, u)
-    last = (92 + 0.72 * s + (len(lines) - 1) * 1.1 * s if land else 1425) * u
+        last = ((1414 - block - 100) / 2 if o["layout"] == "minimal" else 92) * u + block * u
+    else:
+        last = ((1620 if o["layout"] == "minimal" else 1425) + off) * u
     for i, line in enumerate(lines):
         d.text((x0, last - (len(lines) - 1 - i) * 1.1 * s * u), line, fg, f, anchor="ls")
     ax = x0
@@ -325,25 +428,37 @@ def render(album, cover, code=None, size="A4", orientation="portrait", artist_im
         img.paste(ImageOps.fit(artist_img.convert("RGB"), (dia, dia)),
                   (round(x0), round(last + 61 * u - dia / 2)), disc.resize((dia, dia)))
         ax += dia + 18 * u
-    f, _, lines = fit(d, album["artist"], 700, 61, max_w - (ax - x0), 1, u)
+    f, _, lines = fit(d, o["artist"] or album["artist"], F, 61, max_w - (ax - x0), 1)
     d.text((ax, last + 82 * u), " ".join(lines), fg, f, anchor="ls")
-    draw_tracks(d, album["tracks"], x0, last + 155 * u, max_w, foot - 76 * u, u, fg)
+
+    if "tracks" not in hide:
+        times = [f"{ms // 60000}:{ms // 1000 % 60:02}" for ms in album.get("durations", [])] if o["durations"] else []
+        items = [(f"{i}. {clean(t) if o['clean'] else t}", times[i - 1] if times else "")
+                 for i, t in enumerate(album["tracks"], 1)]
+        bottom = foot - 76 * u if set(PARTS[1:]) - hide else H - m  # the footer's room is free when it is hidden
+        draw_tracks(d, items, F, x0, last + 155 * u, max_w, bottom, u, fg, muted, o["columns"])
 
     x = x0
-    for label, value in (("Release date", album["date"]), ("Runtime", album["runtime"])):
-        d.text((x, foot), label, fg, font(38 * u, 700), anchor="ls")
-        d.text((x, foot + 46 * u), value, muted, font(33 * u, 700), anchor="ls")
-        x += d.textlength(label, font=font(38 * u, 700)) + 59 * u
+    for part, label in (("date", "Release date"), ("runtime", "Runtime")):
+        if part not in hide:
+            d.text((x, foot), label, fg, F(38), anchor="ls")
+            d.text((x, foot + 46 * u), album[part], muted, F(33), anchor="ls")
+            x += d.textlength(label, font=F(38)) + 59 * u
 
     # scan code with the palette strip under it: bottom right in portrait, under the dates in landscape
-    cx, cy = (x0, foot + 74 * u) if land else (W - (92 + 248) * u, foot - 37 * u)
-    if code:
+    cx, cy = (x0, foot + 74 * u) if land else (W - m - 248 * u, foot - 37 * u)
+    if code and "code" not in hide:
         code = code.crop(code.getbbox())
         code = code.resize((round(248 * u), round(248 * u * code.height / code.width)), Image.Resampling.LANCZOS)
         img.paste(fg, (round(cx), round(cy + (62 * u - code.height) / 2)), code)
-    for i, c in enumerate(strip):
-        d.rectangle([cx + i * 248 * u / 3, cy + 71 * u, cx + (i + 1) * 248 * u / 3, cy + 88 * u], fill=c)
-    return img
+    if "strip" not in hide:
+        for i, c in enumerate(strip):
+            d.rectangle([cx + i * 248 * u / 3, cy + 71 * u, cx + (i + 1) * 248 * u / 3, cy + 88 * u], fill=c)
+    if o["caption"]:
+        d.text((x0, H - 34 * u), o["caption"], muted, F(20), anchor="ls")
+
+    px = round(o["bleed"] / 25.4 * DPI * scale)
+    return add_bleed(img, px) if px else img
 
 
 def save(img, out, fmt):
@@ -354,10 +469,10 @@ def save(img, out, fmt):
         img.save(out, "PNG", dpi=(DPI, DPI))
 
 
-def poster(album_id, size="A4", orientation="portrait", artist=False):
-    album, cover, code = assets(album_id)
-    pic = artist_image(album["artist_id"]) if artist and album["artist_id"] else None
-    return album, render(album, cover, code, size, orientation, pic)
+def poster(album_id, size="A4", orientation="portrait", picture=False, own=None, scale=1, **opts):
+    album, art, code = assets(album_id)
+    pic = artist_image(album["artist_id"]) if picture and album["artist_id"] else None
+    return album, render(album, own or art, code, size, orientation, pic, scale, **opts)
 
 
 def file_name(album, fmt):
@@ -372,25 +487,51 @@ def valid_id(s):
     return s
 
 
-RENDERING = threading.Lock()  # one poster at a time: an A3 render needs ~150 MB
+# ponytail: one poster at a time, since A3 needs ~150 MB and A2 or 50x70 several times that;
+# the largest sizes can exceed a 512 MB host
+RENDERING = threading.Lock()
+UPLOADS = {}  # key -> own cover; only the latest few are kept
+
+
+def uploaded(q):
+    key = q.get("upload")
+    if key and key not in UPLOADS:
+        raise ValueError("The uploaded cover has expired; upload it again.")
+    return UPLOADS.get(key)
 
 
 class UI(http.server.BaseHTTPRequestHandler):
     # ponytail: stdlib server with no rate limiting, fine for a hobby site; move to gunicorn if it gets real traffic
     def reply(self, body, ctype, status=200, filename=None):
-        self.send_response(status)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        if filename:
-            self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{urllib.parse.quote(filename)}")
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            if filename:
+                self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{urllib.parse.quote(filename)}")
+            self.end_headers()
+            self.wfile.write(body)
+        except ConnectionError:  # the browser dropped a request it no longer needs, e.g. a superseded preview
+            pass
 
     def json(self, obj, status=200):
         self.reply(json.dumps(obj).encode(), "application/json", status)
 
     def log_message(self, *args):
         pass
+
+    def do_POST(self):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+            if self.path != "/upload" or not 0 < n <= 15_000_000:
+                raise ValueError("Upload an image of at most 15 MB.")
+            key = secrets.token_urlsafe(8)
+            UPLOADS[key] = own_cover(io.BytesIO(self.rfile.read(n)))
+            while len(UPLOADS) > 4:
+                UPLOADS.pop(next(iter(UPLOADS)))
+            self.json({"upload": key})
+        except ValueError as e:
+            self.json({"error": str(e)}, 400)
 
     def do_GET(self):
         url = urllib.parse.urlparse(self.path)
@@ -399,7 +540,7 @@ class UI(http.server.BaseHTTPRequestHandler):
             if url.path == "/":
                 self.reply(PAGE.encode(), "text/html; charset=utf-8")
             elif url.path == "/font":
-                self.reply(Path(FONT).read_bytes(), "font/ttf")
+                self.reply((FONT_DIR / FONTS["montserrat"]).read_bytes(), "font/ttf")
             elif url.path == "/search":
                 m, tok = ALBUM_RE.search(q.get("q", "")), token()
                 if m:
@@ -410,22 +551,22 @@ class UI(http.server.BaseHTTPRequestHandler):
                     raise ValueError("Searching by name needs Spotify credentials in .env. Paste an album link instead.")
             elif url.path == "/album":
                 album, cover, _ = assets(valid_id(q.get("id")))
-                bg, fg, strip = palette(cover)
-                self.json({"title": album["title"], "artist": album["artist"],
-                           "colors": ["#%02x%02x%02x" % c for c in (bg, fg, *strip)]})
+                bg, fg, strip, cols = palette(uploaded(q) or cover)
+                bg = options(q)["bg"] or bg
+                fg = readable(fg, bg)
+                self.json({"title": album["title"], "artist": album["artist"],  # colors: page theme
+                           "colors": ["#%02x%02x%02x" % c for c in (bg, fg, *strip)],
+                           "swatches": ["#%02x%02x%02x" % c for c in cols]})
             elif url.path == "/poster":
                 size, orientation, fmt = q.get("size", "A4"), q.get("orientation", "portrait"), q.get("format", "png")
                 if size not in SIZES or orientation not in ORIENTATIONS or fmt not in FORMATS:
                     raise ValueError("Unknown option.")
-                preview = "preview" in q  # same proportions at any size, so previews are always A4
+                opts, preview = options(q), "preview" in q
                 buf = io.BytesIO()
                 with RENDERING:
-                    album, img = poster(valid_id(q.get("id")), "A4" if preview else size, orientation, "artist" in q)
-                    if preview:
-                        img.thumbnail((1400, 1400))
-                        img.save(buf, "PNG")
-                    else:
-                        save(img, buf, fmt)
+                    album, img = poster(valid_id(q.get("id")), size, orientation, "picture" in q, uploaded(q),
+                                        1400 / SIZES[size][1] if preview else 1, **opts)
+                    save(img, buf, "png" if preview else fmt)
                     del img
                 if preview:
                     self.reply(buf.getvalue(), "image/png")
@@ -471,10 +612,10 @@ PAGE = r"""<!doctype html>
         --muted: color-mix(in srgb, var(--fg) 62%, var(--bg)); }
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
-body { margin: 0; min-height: 100vh; display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 470px);
+body { margin: 0; display: grid; grid-template-columns: minmax(0, 1fr) minmax(340px, 480px);
        background: var(--bg); color: var(--fg); font: 700 15px/1.45 Montserrat, system-ui, sans-serif;
        transition: background .5s, color .5s; }
-.stage { display: grid; place-items: center; padding: 5vh 4vw; min-height: 100vh; }
+.stage { position: sticky; top: 0; height: 100vh; display: grid; place-items: center; padding: 5vh 4vw; }
 .stage img { max-width: 100%; max-height: 90vh; box-shadow: 0 18px 60px rgb(0 0 0 / .3); transition: opacity .2s; }
 .stage img.busy { opacity: .45; }
 .stage img:not([src]) { display: none; }
@@ -484,9 +625,8 @@ body { margin: 0; min-height: 100vh; display: grid; grid-template-columns: minma
 h1 { font-size: clamp(34px, 3.3vw, 52px); line-height: 1.05; margin: 0; overflow-wrap: anywhere; }
 h2 { font-size: 25px; line-height: 1.2; margin: 8px 0 0; }
 label, .opts span { display: block; font-size: 19px; }
-label { margin-bottom: 4px; }
-input { width: 100%; border: 0; border-bottom: 3px solid var(--fg); background: none; color: inherit;
-        font: inherit; padding: 8px 0; outline: 0; }
+input:not([type]) { width: 100%; border: 0; border-bottom: 3px solid var(--fg); background: none; color: inherit;
+        font: inherit; font-size: 15px; padding: 8px 0; outline: 0; }
 input::placeholder { color: var(--muted); }
 button, a { font: inherit; color: inherit; cursor: pointer; }
 :is(button, a, input):focus-visible { outline: 2px solid var(--fg); outline-offset: 4px; }
@@ -496,15 +636,21 @@ button, a { font: inherit; color: inherit; cursor: pointer; }
 #results button, #more, .opts button { border: 0; background: none; padding: 0; text-align: left; }
 small, #more, .opts button { color: var(--muted); font-size: 15px; }
 #more { margin-top: 8px; text-decoration: underline; }
-.opts { display: grid; grid-template-columns: 1fr 1fr; gap: 22px 30px; }
-.opts button { margin-right: 16px; border-bottom: 3px solid transparent; }
+.opts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px 30px; }
+.opts .wide { grid-column: 1 / -1; }
+.opts button { margin: 0 16px 4px 0; border-bottom: 3px solid transparent; }
 .opts button.on { color: var(--fg); border-bottom-color: var(--fg); }
+.opts button.sw { width: 24px; height: 24px; margin-right: 8px; border: 2px solid var(--muted); vertical-align: middle; }
+.opts button.sw.on { outline: 2px solid var(--fg); outline-offset: 2px; }
+.opts input[type=color] { width: 30px; height: 26px; padding: 0; border: 0; background: none; vertical-align: middle; cursor: pointer; }
+.opts input[type=file] { font: inherit; font-size: 13px; color: var(--muted); max-width: 100%; }
 #download { align-self: start; padding: 13px 30px; background: var(--fg); color: var(--bg); text-decoration: none;
             font-size: 19px; transition: background .5s, color .5s; }
 #download:not([href]) { opacity: .35; pointer-events: none; }
-.strip { display: flex; width: 190px; height: 13px; margin-top: auto; }
+footer { display: flex; align-items: center; gap: 16px; color: var(--muted); font-size: 13px; }
+.strip { display: flex; width: 190px; height: 13px; }
 .strip i { flex: 1; transition: background .5s; }
-@media (max-width: 860px) { body { grid-template-columns: 1fr; } .stage { min-height: 0; } .panel { padding: 24px; } }
+@media (max-width: 860px) { body { grid-template-columns: 1fr; } .stage { position: static; height: auto; } .panel { padding: 24px; } }
 </style>
 </head>
 <body>
@@ -521,46 +667,143 @@ small, #more, .opts button { color: var(--muted); font-size: 15px; }
     <ol id="results"></ol>
     <button id="more" type="button" hidden>More results</button>
   </form>
-  <div class="opts">
-    <div><span>Size</span><button data-k="size" data-v="A4" class="on">A4</button><button data-k="size" data-v="A3">A3</button></div>
-    <div><span>Format</span><button data-k="format" data-v="png" class="on">PNG</button><button data-k="format" data-v="pdf">PDF</button></div>
-    <div><span>Orientation</span><button data-k="orientation" data-v="portrait" class="on">Portrait</button><button data-k="orientation" data-v="landscape">Landscape</button></div>
-    <div><span>Artist picture</span><button data-k="artist" data-v="" class="on">Off</button><button data-k="artist" data-v="1">On</button></div>
-  </div>
+  <div class="opts" id="opts"></div>
   <a id="download">Download</a>
-  <div class="strip"><i style="background: var(--c1)"></i><i style="background: var(--c2)"></i><i style="background: var(--c3)"></i></div>
+  <footer><div class="strip"><i style="background: var(--c1)"></i><i style="background: var(--c2)"></i><i style="background: var(--c3)"></i></div>v__VERSION__</footer>
 </aside>
 <script>
 const $ = s => document.querySelector(s);
-const state = {id: '', size: 'A4', orientation: 'portrait', format: 'png', artist: ''};
-let query = '', offset = 0;
+const el = (tag, text, cls) => { const e = document.createElement(tag); if (text) e.textContent = text; if (cls) e.className = cls; return e; };
+const state = {id: '', size: 'A4', format: 'png', orientation: 'portrait', layout: 'standard', cover: 'fade',
+  font: 'montserrat', weight: 'bold', columns: '0', bleed: '0', picture: '', durations: '', clean: '',
+  title: '', artist: '', caption: '', bg: '', fg: '', upload: ''};
+const hidden = new Set();   // poster parts switched off
+const marks = [];           // [button, isOn] pairs, repainted by mark()
+let album = null, query = '', offset = 0, timer;
+
+const CHOICES = [
+  ['Size', 'size', [['A5', 'A5'], ['A4', 'A4'], ['A3', 'A3'], ['A2', 'A2'], ['LETTER', 'Letter'], ['50X70', '50×70']], true],
+  ['Orientation', 'orientation', [['portrait', 'Portrait'], ['landscape', 'Landscape']]],
+  ['Format', 'format', [['png', 'PNG'], ['pdf', 'PDF']]],
+  ['Layout', 'layout', [['standard', 'Standard'], ['cover-right', 'Cover right'], ['minimal', 'Minimal']], true],
+  ['Cover', 'cover', [['fade', 'Fade'], ['soft', 'Soft'], ['sharp', 'Sharp'], ['framed', 'Framed']], true],
+  ['Font', 'font', [['montserrat', 'Montserrat'], ['playfair', 'Playfair']]],
+  ['Weight', 'weight', [['light', 'Light'], ['bold', 'Bold'], ['black', 'Black']]],
+  ['Track columns', 'columns', [['0', 'Auto'], ['1', '1'], ['2', '2'], ['3', '3']]],
+  ['Bleed', 'bleed', [['0', 'None'], ['3', '3 mm'], ['5', '5 mm']]],
+];
+const SHOW = [['Tracklist', 'tracks'], ['Release date', 'date'], ['Runtime', 'runtime'], ['Scan code', 'code'], ['Colour strip', 'strip']];
+const FLAGS = [['Artist picture', 'picture'], ['Track durations', 'durations'], ['Clean track names', 'clean']];
+const TEXTS = [['Title', 'title'], ['Artist', 'artist'], ['Caption', 'caption']];
+
 const say = t => { $('#status').textContent = t; };
 const get = (path, p) => fetch(path + '?' + new URLSearchParams(p)).then(r => r.json())
   .catch(() => ({error: 'Could not reach Framefy. Is it still running?'}));
 
-function refresh(preview) {
-  if (!state.id) return;
+function params() {
   const p = new URLSearchParams(state);
+  p.set('hide', [...hidden].join(','));
+  return p;
+}
+function refresh(preview) {
+  mark();
+  if (!state.id) return;
+  const p = params();
   $('#download').href = '/poster?' + p;
   if (!preview) return;
   p.set('preview', 1);
   $('#preview').classList.add('busy');
   $('#preview').src = '/poster?' + p;
 }
-$('#preview').onload = e => { e.target.classList.remove('busy'); $('.empty').hidden = true; say(''); };
-$('#preview').onerror = e => { e.target.classList.remove('busy'); say('Could not make the poster.'); };
+function mark() {
+  for (const [b, isOn] of marks) { b.classList.toggle('on', isOn()); b.setAttribute('aria-pressed', isOn()); }
+  if (!album) return;
+  const c = [album.colors[0], state.fg || album.colors[1], ...album.colors.slice(2)];
+  ['--bg', '--fg', '--c1', '--c2', '--c3'].forEach((v, i) => document.documentElement.style.setProperty(v, c[i]));
+}
+function button(text, isOn, click, cls, after = () => refresh(true)) {
+  const b = el('button', text, cls);
+  b.type = 'button';
+  b.onclick = () => { click(); after(); };
+  marks.push([b, isOn]);
+  return b;
+}
+function group(label, wide, ...children) {
+  const div = el('div', '', wide ? 'wide' : '');
+  div.append(el('span', label), ...children);
+  $('#opts').append(div);
+  return div;
+}
 
-async function choose(id) {
+for (const [label, key, values, wide] of CHOICES)
+  group(label, wide, ...values.map(([v, text]) => button(text, () => state[key] === v, () => { state[key] = v; })));
+group('Show', true,
+  ...SHOW.map(([text, part]) => button(text, () => !hidden.has(part), () => { hidden.has(part) ? hidden.delete(part) : hidden.add(part); })),
+  ...FLAGS.map(([text, key]) => button(text, () => !!state[key], () => { state[key] = state[key] ? '' : '1'; })));
+const swatches = {bg: group('Background', false), fg: group('Text colour', false)};
+for (const [label, key] of TEXTS) {
+  const input = el('input');
+  input.setAttribute('aria-label', label);
+  input.dataset.k = key;
+  input.oninput = () => { clearTimeout(timer); timer = setTimeout(() => { state[key] = input.value.trim(); refresh(true); }, 500); };
+  group(label, true, input);
+}
+const file = el('input'), remove = button('Use the album cover', () => !state.upload, () => { state.upload = ''; file.value = ''; load(); });
+file.type = 'file';
+file.accept = 'image/*';
+file.setAttribute('aria-label', 'Own cover image');
+file.onchange = async () => {
+  if (!file.files[0]) return;
+  say('Uploading…');
+  const r = await fetch('/upload', {method: 'POST', body: file.files[0]}).then(r => r.json()).catch(() => ({error: 'Upload failed.'}));
+  if (r.error) return say(r.error);
+  state.upload = r.upload;
+  load();
+};
+group('Own cover', true, file, el('br'), remove);
+
+function paint() {   // colour swatches for the loaded cover
+  for (const key of ['bg', 'fg']) {
+    const div = swatches[key];
+    while (div.children.length > 1) { const b = div.lastChild; marks.splice(marks.findIndex(m => m[0] === b), 1); b.remove(); }
+    const after = key === 'bg' ? load : undefined;
+    div.append(button('Auto', () => !state[key], () => { state[key] = ''; }, '', after));
+    for (const c of album.swatches) {
+      const b = button('', () => state[key] === c, () => { state[key] = c; }, 'sw', after);
+      b.style.background = c;
+      b.setAttribute('aria-label', c);
+      div.append(b);
+    }
+    const pick = el('input');
+    pick.type = 'color';
+    pick.setAttribute('aria-label', 'Custom colour');
+    pick.value = state[key] || album.colors[key === 'bg' ? 0 : 1];
+    pick.onchange = () => { state[key] = pick.value; key === 'bg' ? load() : refresh(true); };
+    div.append(pick);
+  }
+}
+
+async function load() {
+  if (!state.id) return mark();
   say('Loading…');
-  const a = await get('/album', {id});
+  const a = await get('/album', {id: state.id, upload: state.upload, bg: state.bg});
   if (a.error) return say(a.error);
-  state.id = id;
-  location.hash = id;  // so a reload keeps the album
+  album = a;
   $('h1').textContent = a.title;
   $('h2').textContent = a.artist;
-  ['--bg', '--fg', '--c1', '--c2', '--c3'].forEach((v, i) => document.documentElement.style.setProperty(v, a.colors[i]));
+  document.querySelector('[data-k=title]').placeholder = a.title;
+  document.querySelector('[data-k=artist]').placeholder = a.artist;
+  paint();
   refresh(true);
 }
+function choose(id) {
+  state.id = id;
+  state.bg = state.fg = '';
+  location.hash = id;  // so a reload keeps the album
+  load();
+}
+$('#preview').onload = e => { e.target.classList.remove('busy'); $('.empty').hidden = true; say(''); };
+$('#preview').onerror = e => { e.target.classList.remove('busy'); say('Could not make the poster.'); };
 
 async function find(more) {
   if (!more) { query = $('#q').value.trim(); offset = 0; $('#results').replaceChildren(); }
@@ -572,11 +815,9 @@ async function find(more) {
   if (r.id) return choose(r.id);
   say(r.results.length || offset ? '' : 'No albums found.');
   for (const a of r.results) {
-    const li = document.createElement('li'), b = document.createElement('button'), s = document.createElement('small');
+    const li = el('li'), b = el('button', a.title);
     b.type = 'button';
-    b.textContent = a.title;
-    s.textContent = ` ${a.artist} · ${a.year}`;
-    b.append(s);
+    b.append(el('small', ` ${a.artist} · ${a.year}`));
     b.onclick = () => choose(a.id);
     li.append(b);
     $('#results').append(li);
@@ -585,42 +826,53 @@ async function find(more) {
   $('#more').hidden = r.results.length < 10;
 }
 $('form').onsubmit = e => { e.preventDefault(); find(false); };
-if (location.hash) choose(location.hash.slice(1));
 $('#more').onclick = () => find(true);
-document.querySelectorAll('.opts button').forEach(b => {
-  b.type = 'button';
-  b.setAttribute('aria-pressed', b.classList.contains('on'));
-  b.onclick = () => {
-    state[b.dataset.k] = b.dataset.v;
-    b.parentNode.querySelectorAll('button').forEach(o => {
-      o.classList.toggle('on', o === b);
-      o.setAttribute('aria-pressed', o === b);
-    });
-    refresh(b.dataset.k === 'orientation' || b.dataset.k === 'artist');
-  };
-});
+mark();
+if (location.hash) choose(location.hash.slice(1));
 </script>
 </body>
 </html>
-"""
+""".replace("__VERSION__", VERSION)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("album", nargs="?", help="Spotify album link, or text to search for; leave out to open the UI")
+    p.add_argument("--version", action="version", version=VERSION)
     p.add_argument("--size", type=str.upper, choices=list(SIZES), default="A4")
     p.add_argument("--orientation", type=str.lower, choices=ORIENTATIONS, default="portrait")
     p.add_argument("--format", type=str.lower, choices=FORMATS, default="png")
+    p.add_argument("--layout", choices=LAYOUTS, default="standard", help="cover-right applies to landscape")
+    p.add_argument("--cover", choices=list(FADES), default="fade", help="how the cover meets the background")
+    p.add_argument("--cover-image", metavar="FILE", help="use your own image instead of the album cover")
+    p.add_argument("--bg", metavar="HEX", help="background colour, e.g. #ecebe6 (default: from the cover)")
+    p.add_argument("--text", dest="fg", metavar="HEX", help="text colour (default: from the cover)")
+    p.add_argument("--font", choices=list(FONTS), default="montserrat")
+    p.add_argument("--weight", choices=list(WEIGHTS), default="bold")
+    p.add_argument("--hide", metavar="PARTS", help=f"comma-separated parts to leave out: {', '.join(PARTS)}")
     p.add_argument("--artist-image", action="store_true", help="show the artist's profile picture next to their name")
+    p.add_argument("--durations", action="store_true", help="show each track's length")
+    p.add_argument("--clean-titles", dest="clean", action="store_true", help="drop (feat. ...) and remaster notes from track names")
+    p.add_argument("--columns", type=int, choices=range(5), default=0, help="tracklist columns (default: automatic)")
+    p.add_argument("--title", help="replace the album title")
+    p.add_argument("--artist", help="replace the artist name")
+    p.add_argument("--caption", help="small line at the bottom, e.g. the record label")
+    p.add_argument("--bleed", type=int, default=0, metavar="MM", help="extra margin for print shops, 0-10 mm")
     p.add_argument("-o", "--output", help="output file (default: '<artist> - <album>.<format>')")
     args = p.parse_args()
     if not args.album:
         return serve()
     try:
+        opts = options({k: "" if v in (None, False) else str(v) for k, v in vars(args).items()})
+        cover = own_cover(args.cover_image) if args.cover_image else None
+    except ValueError as e:
+        p.error(str(e))
+    try:
         m, tok = ALBUM_RE.search(args.album), token()
         if not m and not tok:
             sys.exit("Searching by name needs Spotify credentials in .env; pass an album link instead.")
-        album, img = poster(m.group(1) if m else pick(args.album, tok), args.size, args.orientation, args.artist_image)
+        album, img = poster(m.group(1) if m else pick(args.album, tok), args.size, args.orientation,
+                            args.artist_image, cover, **opts)
     except urllib.error.HTTPError as e:
         sys.exit(f"Spotify error {e.code}: {e.read().decode(errors='replace')[:300]}")
     out = args.output or file_name(album, args.format)
