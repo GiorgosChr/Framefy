@@ -14,7 +14,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 API = "https://api.spotify.com/v1"
 ALBUM_RE = re.compile(r"(?:open\.spotify\.com/(?:intl-\w+/)?album/|spotify:album:)([A-Za-z0-9]{22})")
@@ -110,6 +110,7 @@ def load_album(album_id, tok):
         "id": a["id"],
         "title": a["name"],
         "artist": ", ".join(x["name"] for x in a["artists"]),
+        "artist_id": a["artists"][0]["id"],
         "date": fmt_date(a["release_date"]),
         "runtime": fmt_runtime(sum(t["duration_ms"] for t in tracks)),
         "tracks": [t["name"] for t in tracks],
@@ -215,7 +216,7 @@ def draw_tracks(d, tracks, x, y, max_w, bottom, u, fill):
         x += w + 30 * u
 
 
-def render(album, cover, code=None, size="A4", orientation="portrait"):
+def render(album, cover, code=None, size="A4", orientation="portrait", artist_img=None):
     """Layout numbers are in units of short side / 1414, measured off the reference posters."""
     short, long = SIZES[size]
     land = orientation == "landscape"
@@ -236,7 +237,7 @@ def render(album, cover, code=None, size="A4", orientation="portrait"):
         mask = mask.transpose(Image.Transpose.TRANSPOSE)
     img.paste(cover.convert("RGB").resize((short, short), Image.Resampling.LANCZOS), (0, 0), mask)
 
-    x0 = (1273 if land else 92) * u
+    x0 = (1360 if land else 92) * u
     max_w = W - 92 * u - x0
     foot = (1188 if land else 1886) * u  # baseline of the "Release date" label
 
@@ -244,8 +245,16 @@ def render(album, cover, code=None, size="A4", orientation="portrait"):
     last = (92 + 0.72 * s + (len(lines) - 1) * 1.1 * s if land else 1425) * u
     for i, line in enumerate(lines):
         d.text((x0, last - (len(lines) - 1 - i) * 1.1 * s * u), line, fg, f, anchor="ls")
-    f, _, lines = fit(d, album["artist"], 700, 61, max_w, 1, u)
-    d.text((x0, last + 82 * u), " ".join(lines), fg, f, anchor="ls")
+    ax = x0
+    if artist_img:  # round profile picture in front of the artist name
+        dia = round(64 * u)
+        disc = Image.new("L", (dia * 4, dia * 4))
+        ImageDraw.Draw(disc).ellipse((0, 0, dia * 4 - 1, dia * 4 - 1), fill=255)
+        img.paste(ImageOps.fit(artist_img.convert("RGB"), (dia, dia)),
+                  (round(x0), round(last + 61 * u - dia / 2)), disc.resize((dia, dia)))
+        ax += dia + 18 * u
+    f, _, lines = fit(d, album["artist"], 700, 61, max_w - (ax - x0), 1, u)
+    d.text((ax, last + 82 * u), " ".join(lines), fg, f, anchor="ls")
     draw_tracks(d, album["tracks"], x0, last + 155 * u, max_w, foot - 76 * u, u, fg)
 
     x = x0
@@ -279,13 +288,22 @@ def main():
     p.add_argument("--size", type=str.upper, choices=list(SIZES), default="A4")
     p.add_argument("--orientation", type=str.lower, choices=["portrait", "landscape"], default="portrait")
     p.add_argument("--format", type=str.lower, choices=["png", "pdf"], default="png")
+    p.add_argument("--artist-image", action="store_true", help="show the artist's profile picture next to their name")
     p.add_argument("-o", "--output", help="output file (default: '<artist> - <album>.<format>')")
     args = p.parse_args()
     try:
         tok = token()
         m = ALBUM_RE.search(args.album)
         album = load_album(m.group(1) if m else pick(args.album, tok), tok)
-        img = render(album, load_cover(album["cover_url"]), load_code(album["id"]), args.size, args.orientation)
+        artist_img = None
+        if args.artist_image:
+            images = api(f"/artists/{album['artist_id']}", tok)["images"]
+            if images:
+                artist_img = load_cover(images[0]["url"])
+            else:
+                print("warning: the artist has no profile picture", file=sys.stderr)
+        img = render(album, load_cover(album["cover_url"]), load_code(album["id"]),
+                     args.size, args.orientation, artist_img)
     except urllib.error.HTTPError as e:
         sys.exit(f"Spotify error {e.code}: {e.read().decode(errors='replace')[:300]}")
     name = re.sub(r'[\\/:*?"<>|]', "_", f"{album['artist']} - {album['title']}")

@@ -37,7 +37,8 @@ album = {"title": "A Fairly Long Album Title: With A Subtitle", "artist": "Some 
 for size, (short, long) in framefy.SIZES.items():
     for orientation in ("portrait", "landscape"):
         for cover, tracks in zip(covers, ([f"Track number {i}" for i in range(40)], [])):
-            img = framefy.render({**album, "tracks": tracks}, cover, code if tracks else None, size, orientation)
+            img = framefy.render({**album, "tracks": tracks}, cover, code if tracks else None, size, orientation,
+                                 covers[0] if tracks else None)
             assert img.size == ((long, short) if orientation == "landscape" else (short, long))
 
 buf = io.BytesIO()

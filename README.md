@@ -1,4 +1,4 @@
-# framefy
+# Framefy
 
 Makes a printable poster from a Spotify album.
 
@@ -23,4 +23,5 @@ Search text lists matching albums to browse and pick from; an album link skips t
 | `--size` | `A4`, `A3` | `A4` |
 | `--orientation` | `portrait`, `landscape` | `portrait` |
 | `--format` | `png`, `pdf` | `png` |
+| `--artist-image` | flag: adds the artist's profile picture next to their name | off |
 | `-o` | output file | `<artist> - <album>.<format>` |
