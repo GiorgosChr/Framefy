@@ -13,8 +13,8 @@ Then edit `.env` and replace the two placeholders with the client ID and secret 
 
 ## Use
 
-    python framefy.py "periphery clear"
-    python framefy.py https://open.spotify.com/album/5DeKC7Werv3iQRhWWANQFj --size A3 --orientation landscape --format pdf
+    python framefy.py "polaris the guilt and the grief"
+    python framefy.py https://open.spotify.com/album/30TlXptEYPQHt9ozcEeqBt --size A3 --orientation landscape --format pdf
 
 Search text lists matching albums to browse and pick from; an album link skips the search.
 

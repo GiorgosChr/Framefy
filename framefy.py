@@ -176,7 +176,8 @@ def palette(cover):
         fg = mix(base, target, t / 20)
         if contrast(fg, bg) >= 4.5:
             break
-    return bg, fg, (cols[1:] + [fg] * 3)[:3]
+    strip = sorted(cols[1:], key=lambda c: contrast(c, bg), reverse=True)  # ones that show up on bg first
+    return bg, fg, (strip + [fg] * 3)[:3]
 
 
 def wrap(d, text, f, max_w):
