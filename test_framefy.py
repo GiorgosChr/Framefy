@@ -8,6 +8,7 @@ import re
 import tempfile
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 
 from PIL import Image
@@ -36,6 +37,7 @@ assert os.environ["FRAMEFY_TEST_A"] == "abc" and os.environ["FRAMEFY_TEST_B"] ==
 o = framefy.options({"bg": "#ECEBE6", "fg": "000000", "hide": "tracks,code", "columns": "2", "clean": "1"})
 assert o["bg"] == (236, 235, 230) and o["fg"] == (0, 0, 0) and o["hide"] == ["tracks", "code"]
 assert o["columns"] == 2 and o["clean"] and not o["durations"] and o["cover"] == "fade"
+assert framefy.options({"hide": "artists"})["hide"] == ["artists"]
 for bad in ({"bg": "red"}, {"hide": "everything"}, {"columns": "9"}, {"font": "comic"}, {"bleed": "50"}):
     try:
         framefy.options(bad)
@@ -91,11 +93,77 @@ assert framefy.parse_public(embed, page) == {
     "id": ID, "title": "An Album", "artist": "Some Artist", "artist_id": "a" * 22, "date": "Jan 29, 2016",
     "runtime": "2min 1s", "tracks": ["One", "Two"], "durations": [60_000, 61_000], "cover_url": "big"}
 
+# collections: several Spotify albums, keyless
+assert framefy.mosaic([gradient] * 5).size == (1998, 1998) and framefy.mosaic([white], 100).size == (100, 100)
+assert framefy.source(ID) == ID and framefy.source(f"{ID},{ID}") == (ID, ID) and framefy.source("jellyfin") == "jellyfin"
+for bad in ("", "jellyfin,x", f"{ID},", ",".join([ID] * 101)):
+    try:
+        framefy.source(bad)
+        raise AssertionError(f"accepted {bad}")
+    except ValueError:
+        pass
+real_fetch, framefy.token = framefy.fetch, lambda: None
+framefy.fetch = lambda url, *a: embed.encode() if "/embed/" in url else wide.getvalue()
+two = (ID, "b" * 22)
+shown, img = framefy.poster(two, scale=0.1)
+assert shown["title"] == "Albums" and shown["artist"] == "2 albums" and shown["tracks"] == ["An Album — Some Artist"] * 2
+assert img.size == (248, 351) and framefy.collection(two)[1].size == (2000, 2000)
+assert framefy.poster(two, "A5", "landscape", scale=0.1, hide=["artists", "strip"])[0]["tracks"] == ["An Album"] * 2
+framefy.fetch = real_fetch
+
+
+# collections: Jellyfin favourites, from a fake server
+class Jelly(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        url = urllib.parse.urlparse(self.path)
+        q = dict(urllib.parse.parse_qsl(url.query))
+        if self.headers["Authorization"] != 'MediaBrowser Token="key"':
+            return self.send_error(401)
+        if url.path == "/Users":
+            body = json.dumps([{"Name": "Other", "Id": "u0"}, {"Name": "Me", "Id": "u1"}]).encode()
+        elif url.path == "/Items" and q == {"userId": "u1", "Filters": "IsFavorite", "IncludeItemTypes": "MusicAlbum",
+                                            "Recursive": "true", "SortBy": "SortName"}:
+            body = json.dumps({"Items": [
+                {"Name": "First", "AlbumArtist": "Band", "Id": "i1", "ImageTags": {"Primary": "t"}},
+                {"Name": "No Art", "Id": "i2", "ImageTags": {}}]}).encode()
+        elif url.path == "/Items/i1/Images/Primary":
+            body = wide.getvalue()
+        else:
+            return self.send_error(404)
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+jelly = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Jelly)
+threading.Thread(target=jelly.serve_forever, daemon=True).start()
+os.environ.update(JELLYFIN_URL=f"http://127.0.0.1:{jelly.server_port}/", JELLYFIN_API_KEY="key", JELLYFIN_USER="me")
+shown, img = framefy.poster("jellyfin", scale=0.1)
+assert shown["title"] == "Favourites" and shown["artist"] == "2 albums" and shown["tracks"] == ["First — Band", "No Art"]
+assert framefy.poster("jellyfin", scale=0.1, hide=["artists"])[0]["tracks"] == ["First", "No Art"]
+for env, error in (({"JELLYFIN_USER": "nobody"}, ValueError), ({"JELLYFIN_API_KEY": "wrong"}, RuntimeError)):
+    os.environ.update(env)
+    try:
+        framefy.favourites()
+        raise AssertionError(f"accepted {env}")
+    except error:
+        pass
+os.environ.update(JELLYFIN_API_KEY="key", JELLYFIN_USER="me")
+
 # UI
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), framefy.UI)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 base = f"http://127.0.0.1:{srv.server_port}"
-assert b"<title>Framefy</title>" in urllib.request.urlopen(base + "/").read()
+home = urllib.request.urlopen(base + "/").read()
+assert b"<title>Framefy</title>" in home and b'id="jellyfin" type="button" >' in home  # shown: JELLYFIN_URL is set
+links = urllib.parse.quote(f"spotify:album:{ID} https://open.spotify.com/album/{'b' * 22} spotify:album:{ID}")
+assert json.loads(urllib.request.urlopen(f"{base}/search?q={links}").read()) == {"id": f"{ID},{'b' * 22}"}
+assert json.loads(urllib.request.urlopen(base + "/album?id=jellyfin").read())["title"] == "Favourites"
+assert urllib.request.urlopen(base + "/poster?id=jellyfin&preview=1&hide=artists").read()[:4] == b"\x89PNG"
 key = json.loads(urllib.request.urlopen(urllib.request.Request(base + "/upload", data=wide.getvalue())).read())["upload"]
 assert framefy.UPLOADS[key].size == (200, 200)
 for bad in (urllib.request.Request(base + "/album?id=not-an-album"), urllib.request.Request(base + "/upload", data=b"junk")):
@@ -105,5 +173,6 @@ for bad in (urllib.request.Request(base + "/album?id=not-an-album"), urllib.requ
     except urllib.error.HTTPError as e:
         assert e.code == 400 and "error" in json.loads(e.read())
 srv.shutdown()
+jelly.shutdown()
 
 print("ok")

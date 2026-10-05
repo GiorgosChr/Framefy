@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Make a poster from a Spotify album."""
+"""Make a poster from a Spotify album, or one mosaic poster from several albums."""
 import argparse
 import base64
 import calendar
+import concurrent.futures
 import functools
 import http.server
 import io
+import itertools
 import json
+import math
 import os
 import re
 import secrets
@@ -23,7 +26,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 API = "https://api.spotify.com/v1"
 ALBUM_RE = re.compile(r"(?:open\.spotify\.com/(?:intl-\w+/)?album/|spotify:album:)([A-Za-z0-9]{22})")
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 FONT_DIR = Path(__file__).parent / "fonts"
 FONTS = {"montserrat": "Montserrat.ttf", "playfair": "PlayfairDisplay.ttf"}
 WEIGHTS = {"light": 500, "bold": 700, "black": 900}
@@ -149,7 +152,7 @@ def load_album(album_id, tok):
     }
 
 
-def parse_public(embed_html, album_html):
+def parse_public(embed_html, album_html=""):
     """Same dictionary as load_album, read from Spotify's public embed and album pages (no key)."""
     # ponytail: unofficial; breaks if Spotify changes these pages, and the embed may cut very long albums
     data = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', embed_html, re.S)
@@ -189,18 +192,21 @@ def load_code(album_id):
         print("warning: could not fetch the Spotify code, leaving it out", file=sys.stderr)
 
 
-@functools.lru_cache(maxsize=8)  # a cover is ~12 MB in memory
-def assets(album_id):
-    """Album details, cover and scan code: from the API with a key, from public pages without."""
-    tok, album = token(), None
+def details(album_id, pages=("embed/", "")):
+    """Album details: from the API with a key, from public pages without."""
+    tok = token()
     if tok:
         try:
-            album = load_album(album_id, tok)
+            return load_album(album_id, tok)
         except urllib.error.HTTPError as e:
             print(f"warning: Spotify API error {e.code}, using the public pages", file=sys.stderr)
-    if not album:
-        album = parse_public(*(fetch(f"https://open.spotify.com/{p}album/{album_id}", UA).decode()
-                               for p in ("embed/", "")))
+    return parse_public(*(fetch(f"https://open.spotify.com/{p}album/{album_id}", UA).decode() for p in pages))
+
+
+@functools.lru_cache(maxsize=8)  # a cover is ~12 MB in memory
+def assets(album_id):
+    """Album details, cover and scan code."""
+    album = details(album_id)
     return album, load_image(album["cover_url"]), load_code(album_id)
 
 
@@ -213,6 +219,86 @@ def artist_image(artist_id):
     else:
         url = json.loads(fetch(f"https://open.spotify.com/oembed?url=spotify:artist:{artist_id}", UA)).get("thumbnail_url")
     return load_image(url) if url else None
+
+
+# --- Collections: several albums on one poster ---
+
+def jellyfin(path, **params):
+    """Response body from the Jellyfin server named in .env."""
+    load_env()
+    base, key = os.environ.get("JELLYFIN_URL"), os.environ.get("JELLYFIN_API_KEY")
+    if not (base and key):
+        raise ValueError("Jellyfin needs JELLYFIN_URL and JELLYFIN_API_KEY in .env.")
+    try:
+        return fetch(f"{base.rstrip('/')}{path}?{urllib.parse.urlencode(params)}",
+                     {"Authorization": f'MediaBrowser Token="{key}"'})
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"Jellyfin returned an error ({e.code}).") from None
+    except OSError as e:
+        raise RuntimeError(f"Could not reach Jellyfin: {e}") from None
+
+
+def favourites():
+    """Favourite albums of JELLYFIN_USER (the first user when unset): title, artist and the item id of the cover."""
+    users = json.loads(jellyfin("/Users"))
+    name = os.environ.get("JELLYFIN_USER", "")
+    user = next((u for u in users if not name or u["Name"].lower() == name.lower()), None)
+    if not user:
+        raise ValueError(f"Jellyfin has no user called {name}.")
+    items = json.loads(jellyfin("/Items", userId=user["Id"], Filters="IsFavorite", IncludeItemTypes="MusicAlbum",
+                                Recursive="true", SortBy="SortName"))["Items"]
+    return [(i["Name"], i.get("AlbumArtist") or "", i["Id"] if i.get("ImageTags", {}).get("Primary") else None)
+            for i in items]
+
+
+def mosaic(covers, side=2000):
+    """Square grid of the covers."""
+    # ponytail: a count that is not a square number repeats covers from the first one to fill the grid
+    if not covers:
+        return Image.new("RGB", (side, side), (40, 40, 40))
+    g = math.isqrt(len(covers) - 1) + 1
+    cell = side // g
+    out = Image.new("RGB", (cell * g, cell * g))
+    for i, c in zip(range(g * g), itertools.cycle(covers)):
+        out.paste(ImageOps.fit(c.convert("RGB"), (cell, cell)), (i % g * cell, i // g * cell))
+    return out
+
+
+@functools.lru_cache(maxsize=4)
+def collection(src, stamp=0):
+    """(title, artist) of every album and a mosaic of their covers; src is a tuple of Spotify ids or "jellyfin"."""
+    # ponytail: Jellyfin albums without art stay in the list but get no cell in the mosaic; a list too long
+    # for the page (roughly 100 albums on a portrait sheet) runs off it, so hide the tracks for those
+    jobs = favourites() if src == "jellyfin" else src
+    if not jobs:
+        raise ValueError("Jellyfin has no favourite albums.")
+    side = 2000 // (math.isqrt(len(jobs) - 1) + 1)
+    if src != "jellyfin":
+        token()  # fetched once here rather than by every thread
+
+    def cell(job):
+        if src == "jellyfin":
+            title, artist, item = job
+            cover = item and Image.open(io.BytesIO(jellyfin(f"/Items/{item}/Images/Primary", maxWidth=1000)))
+        else:
+            a = details(job, ("embed/",))
+            title, artist, cover = a["title"], a["artist"], load_image(a["cover_url"])
+        return title, artist, cover and ImageOps.fit(cover.convert("RGB"), (side, side))  # small: there may be 100
+
+    with concurrent.futures.ThreadPoolExecutor(8) as pool:
+        cells = list(pool.map(cell, jobs))
+    return [c[:2] for c in cells], mosaic([c[2] for c in cells if c[2]])
+
+
+def gather(src, hide=()):
+    """assets() of one album; for a collection the cover is a mosaic and the tracks are its albums."""
+    if isinstance(src, str) and src != "jellyfin":
+        return assets(src)
+    jelly = src == "jellyfin"
+    items, art = collection(src, time.time() // 300 if jelly else 0)  # favourites are read again after 5 minutes
+    return {"title": "Favourites" if jelly else "Albums", "artist": f"{len(items)} album{'s' * (len(items) != 1)}",
+            "artist_id": None,
+            "tracks": [t if "artists" in hide or not a else f"{t} — {a}" for t, a in items]}, art, None
 
 
 # --- Rendering ---
@@ -280,8 +366,8 @@ def options(raw):
         return tuple(int(v[i:i + 2], 16) for i in (0, 2, 4)) if v else None
 
     hide = [p for p in (raw.get("hide") or "").split(",") if p]
-    if set(hide) - set(PARTS):
-        raise ValueError(f"hide takes: {', '.join(PARTS)}")
+    if set(hide) - set(PARTS) - {"artists"}:  # artists: those of a collection's albums
+        raise ValueError(f"hide takes: {', '.join(PARTS)}, artists")
     return {
         "bg": colour("bg"), "fg": colour("fg"), "hide": hide,
         "title": (raw.get("title") or "")[:200], "artist": (raw.get("artist") or "")[:200],
@@ -469,8 +555,10 @@ def save(img, out, fmt):
         img.save(out, "PNG", dpi=(DPI, DPI))
 
 
-def poster(album_id, size="A4", orientation="portrait", picture=False, own=None, scale=1, **opts):
-    album, art, code = assets(album_id)
+def poster(src, size="A4", orientation="portrait", picture=False, own=None, scale=1, **opts):
+    album, art, code = gather(src, opts.get("hide", ()))
+    if "date" not in album:  # a collection has no date, runtime or scan code
+        opts["hide"] = [*opts.get("hide", ()), "date", "runtime", "code"]
     pic = artist_image(album["artist_id"]) if picture and album["artist_id"] else None
     return album, render(album, own or art, code, size, orientation, pic, scale, **opts)
 
@@ -481,10 +569,16 @@ def file_name(album, fmt):
 
 # --- UI ---
 
-def valid_id(s):
-    if not re.fullmatch(r"[A-Za-z0-9]{22}", s or ""):
+def source(s):
+    """What a request wants a poster of: an album id, a tuple of several, or "jellyfin"."""
+    ids = tuple((s or "").split(","))
+    if s == "jellyfin":
+        return s
+    if not all(re.fullmatch(r"[A-Za-z0-9]{22}", i) for i in ids):
         raise ValueError("That is not a Spotify album.")
-    return s
+    if len(ids) > 100:
+        raise ValueError("A poster takes 100 albums at most.")
+    return ids[0] if len(ids) == 1 else ids
 
 
 # ponytail: one poster at a time, since A3 needs ~150 MB and A2 or 50x70 several times that;
@@ -538,19 +632,21 @@ class UI(http.server.BaseHTTPRequestHandler):
         q = {k: v[0] for k, v in urllib.parse.parse_qs(url.query).items()}
         try:
             if url.path == "/":
-                self.reply(PAGE.encode(), "text/html; charset=utf-8")
+                load_env()
+                self.reply(PAGE.replace("__JELLYFIN__", "" if os.environ.get("JELLYFIN_URL") else "hidden").encode(),
+                           "text/html; charset=utf-8")
             elif url.path == "/font":
                 self.reply((FONT_DIR / FONTS["montserrat"]).read_bytes(), "font/ttf")
             elif url.path == "/search":
-                m, tok = ALBUM_RE.search(q.get("q", "")), token()
-                if m:
-                    self.json({"id": m.group(1)})
+                ids, tok = dict.fromkeys(ALBUM_RE.findall(q.get("q", ""))), token()
+                if ids:  # several links make a collection
+                    self.json({"id": ",".join(ids)})
                 elif tok:
                     self.json({"results": search(q.get("q", ""), tok, int(q.get("offset", 0)))})
                 else:
                     raise ValueError("Searching by name needs Spotify credentials in .env. Paste an album link instead.")
             elif url.path == "/album":
-                album, cover, _ = assets(valid_id(q.get("id")))
+                album, cover, _ = gather(source(q.get("id")))
                 bg, fg, strip, cols = palette(uploaded(q) or cover)
                 bg = options(q)["bg"] or bg
                 fg = readable(fg, bg)
@@ -564,7 +660,7 @@ class UI(http.server.BaseHTTPRequestHandler):
                 opts, preview = options(q), "preview" in q
                 buf = io.BytesIO()
                 with RENDERING:
-                    album, img = poster(valid_id(q.get("id")), size, orientation, "picture" in q, uploaded(q),
+                    album, img = poster(source(q.get("id")), size, orientation, "picture" in q, uploaded(q),
                                         1400 / SIZES[size][1] if preview else 1, **opts)
                     save(img, buf, "png" if preview else fmt)
                     del img
@@ -633,9 +729,10 @@ button, a { font: inherit; color: inherit; cursor: pointer; }
 #status { margin: 8px 0 0; color: var(--muted); min-height: 1.45em; }
 #results { margin: 0; padding: 0 0 0 1.6em; max-height: 34vh; overflow: auto; }
 #results li { padding: 3px 0; }
-#results button, #more, .opts button { border: 0; background: none; padding: 0; text-align: left; }
-small, #more, .opts button { color: var(--muted); font-size: 15px; }
-#more { margin-top: 8px; text-decoration: underline; }
+#results button, #more, #jellyfin, .opts button { border: 0; background: none; padding: 0; text-align: left; }
+small, #more, #jellyfin, .opts button { color: var(--muted); font-size: 15px; }
+#more, #jellyfin { display: block; margin-top: 8px; text-decoration: underline; }
+body:not(.multi) .multi, body.multi .single { display: none; }
 .opts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px 30px; }
 .opts .wide { grid-column: 1 / -1; }
 .opts button { margin: 0 16px 4px 0; border-bottom: 3px solid transparent; }
@@ -662,10 +759,11 @@ footer { display: flex; align-items: center; gap: 16px; color: var(--muted); fon
   <header><h1>Framefy</h1><h2>Posters from Spotify albums</h2></header>
   <form>
     <label for="q">Album</label>
-    <input id="q" placeholder="Spotify album link, or a name to search" autocomplete="off" autofocus>
+    <input id="q" placeholder="Spotify album link (or several), or a name to search" autocomplete="off" autofocus>
     <p id="status" role="status"></p>
     <ol id="results"></ol>
     <button id="more" type="button" hidden>More results</button>
+    <button id="jellyfin" type="button" __JELLYFIN__>Jellyfin favourites</button>
   </form>
   <div class="opts" id="opts"></div>
   <a id="download">Download</a>
@@ -692,8 +790,10 @@ const CHOICES = [
   ['Track columns', 'columns', [['0', 'Auto'], ['1', '1'], ['2', '2'], ['3', '3']]],
   ['Bleed', 'bleed', [['0', 'None'], ['3', '3 mm'], ['5', '5 mm']]],
 ];
-const SHOW = [['Tracklist', 'tracks'], ['Release date', 'date'], ['Runtime', 'runtime'], ['Scan code', 'code'], ['Colour strip', 'strip']];
-const FLAGS = [['Artist picture', 'picture'], ['Track durations', 'durations'], ['Clean track names', 'clean']];
+// a third entry is a class: single = one album only, multi = several albums only
+const SHOW = [['Tracklist', 'tracks'], ['Release date', 'date', 'single'], ['Runtime', 'runtime', 'single'],
+  ['Scan code', 'code', 'single'], ['Colour strip', 'strip'], ['Album artists', 'artists', 'multi']];
+const FLAGS = [['Artist picture', 'picture', 'single'], ['Track durations', 'durations', 'single'], ['Clean track names', 'clean']];
 const TEXTS = [['Title', 'title'], ['Artist', 'artist'], ['Caption', 'caption']];
 
 const say = t => { $('#status').textContent = t; };
@@ -738,8 +838,8 @@ function group(label, wide, ...children) {
 for (const [label, key, values, wide] of CHOICES)
   group(label, wide, ...values.map(([v, text]) => button(text, () => state[key] === v, () => { state[key] = v; })));
 group('Show', true,
-  ...SHOW.map(([text, part]) => button(text, () => !hidden.has(part), () => { hidden.has(part) ? hidden.delete(part) : hidden.add(part); })),
-  ...FLAGS.map(([text, key]) => button(text, () => !!state[key], () => { state[key] = state[key] ? '' : '1'; })));
+  ...SHOW.map(([text, part, cls]) => button(text, () => !hidden.has(part), () => { hidden.has(part) ? hidden.delete(part) : hidden.add(part); }, cls)),
+  ...FLAGS.map(([text, key, cls]) => button(text, () => !!state[key], () => { state[key] = state[key] ? '' : '1'; }, cls)));
 const swatches = {bg: group('Background', false), fg: group('Text colour', false)};
 for (const [label, key] of TEXTS) {
   const input = el('input');
@@ -799,6 +899,7 @@ async function load() {
 function choose(id) {
   state.id = id;
   state.bg = state.fg = '';
+  document.body.classList.toggle('multi', id === 'jellyfin' || id.includes(','));
   location.hash = id;  // so a reload keeps the album
   load();
 }
@@ -827,6 +928,7 @@ async function find(more) {
 }
 $('form').onsubmit = e => { e.preventDefault(); find(false); };
 $('#more').onclick = () => find(true);
+$('#jellyfin').onclick = () => choose('jellyfin');
 mark();
 if (location.hash) choose(location.hash.slice(1));
 </script>
@@ -836,8 +938,10 @@ if (location.hash) choose(location.hash.slice(1));
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("album", nargs="?", help="Spotify album link, or text to search for; leave out to open the UI")
+    p = argparse.ArgumentParser(description=__doc__, fromfile_prefix_chars="@")
+    p.add_argument("album", nargs="*", help="Spotify album link, or text to search for; several links (or @FILE with "
+                                            "one a line) make one mosaic poster; leave out to open the UI")
+    p.add_argument("--jellyfin", action="store_true", help="mosaic poster of your Jellyfin favourite albums")
     p.add_argument("--version", action="version", version=VERSION)
     p.add_argument("--size", type=str.upper, choices=list(SIZES), default="A4")
     p.add_argument("--orientation", type=str.lower, choices=ORIENTATIONS, default="portrait")
@@ -849,7 +953,7 @@ def main():
     p.add_argument("--text", dest="fg", metavar="HEX", help="text colour (default: from the cover)")
     p.add_argument("--font", choices=list(FONTS), default="montserrat")
     p.add_argument("--weight", choices=list(WEIGHTS), default="bold")
-    p.add_argument("--hide", metavar="PARTS", help=f"comma-separated parts to leave out: {', '.join(PARTS)}")
+    p.add_argument("--hide", metavar="PARTS", help=f"comma-separated parts to leave out: {', '.join(PARTS)}, artists")
     p.add_argument("--artist-image", action="store_true", help="show the artist's profile picture next to their name")
     p.add_argument("--durations", action="store_true", help="show each track's length")
     p.add_argument("--clean-titles", dest="clean", action="store_true", help="drop (feat. ...) and remaster notes from track names")
@@ -860,7 +964,8 @@ def main():
     p.add_argument("--bleed", type=int, default=0, metavar="MM", help="extra margin for print shops, 0-10 mm")
     p.add_argument("-o", "--output", help="output file (default: '<artist> - <album>.<format>')")
     args = p.parse_args()
-    if not args.album:
+    args.album = [a for a in args.album if a.strip()]  # blank lines of an @FILE
+    if not args.album and not args.jellyfin:
         return serve()
     try:
         opts = options({k: "" if v in (None, False) else str(v) for k, v in vars(args).items()})
@@ -868,13 +973,24 @@ def main():
     except ValueError as e:
         p.error(str(e))
     try:
-        m, tok = ALBUM_RE.search(args.album), token()
-        if not m and not tok:
+        found = [ALBUM_RE.search(a) for a in args.album]
+        if args.jellyfin:
+            src = "jellyfin"
+        elif len(found) > 1:
+            if not all(found):
+                sys.exit("Several albums must all be Spotify album links.")
+            src = tuple(dict.fromkeys(m.group(1) for m in found))
+        elif found[0]:
+            src = found[0].group(1)
+        elif tok := token():
+            src = pick(args.album[0], tok)
+        else:
             sys.exit("Searching by name needs Spotify credentials in .env; pass an album link instead.")
-        album, img = poster(m.group(1) if m else pick(args.album, tok), args.size, args.orientation,
-                            args.artist_image, cover, **opts)
+        album, img = poster(src, args.size, args.orientation, args.artist_image, cover, **opts)
     except urllib.error.HTTPError as e:
         sys.exit(f"Spotify error {e.code}: {e.read().decode(errors='replace')[:300]}")
+    except (ValueError, RuntimeError) as e:
+        sys.exit(str(e))
     out = args.output or file_name(album, args.format)
     save(img, out, args.format)
     print(out)

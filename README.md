@@ -1,6 +1,6 @@
 # Framefy
 
-Makes a printable poster from a Spotify album.
+Makes a printable poster from a Spotify album, or one mosaic poster from several albums.
 
 <img src="examples/portrait.png" height="320"> <img src="examples/landscape.png" height="320">
 
@@ -29,7 +29,7 @@ From the terminal instead:
 | `--bg`, `--text` | colour such as `#ecebe6` | from the cover |
 | `--font` | `montserrat`, `playfair` | `montserrat` |
 | `--weight` | `light`, `bold`, `black` | `bold` |
-| `--hide` | comma-separated: `tracks`, `date`, `runtime`, `code`, `strip` | nothing |
+| `--hide` | comma-separated: `tracks`, `date`, `runtime`, `code`, `strip`, `artists` (mosaic) | nothing |
 | `--artist-image` | flag: artist's profile picture next to their name | off |
 | `--durations` | flag: each track's length | off |
 | `--clean-titles` | flag: drops `(feat. …)` and remaster notes from track names | off |
@@ -38,6 +38,24 @@ From the terminal instead:
 | `--caption` | small line at the bottom | none |
 | `--bleed` | `0` to `10` mm extra margin for print shops | `0` |
 | `-o` | output file | `<artist> - <album>.<format>` |
+
+## Several albums
+
+Several links, in the UI box or on the command line, make one poster: a mosaic of the covers above the list of albums. `@albums.txt` reads one link per line.
+
+    python framefy.py @albums.txt --title "Heavy rotation" --hide artists
+
+## Jellyfin favourites
+
+    python framefy.py --jellyfin
+
+makes the same poster from your favourite albums in Jellyfin; the UI gets a button for it. Add the server to `.env`:
+
+    JELLYFIN_URL=http://localhost:8096
+    JELLYFIN_API_KEY=
+    JELLYFIN_USER=
+
+The API key comes from Dashboard → API Keys. `JELLYFIN_USER` is the user name; left empty, the first user is used.
 
 ## Searching by name (optional)
 
