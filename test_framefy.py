@@ -103,7 +103,8 @@ for bad in ("", "jellyfin,x", f"{ID},", ",".join([ID] * 101)):
     except ValueError:
         pass
 real_fetch, framefy.token = framefy.fetch, lambda: None
-framefy.fetch = lambda url, *a: embed.encode() if "/embed/" in url else wide.getvalue()
+framefy.fetch = lambda url, *a: (embed if "/embed/" in url else page).encode() if "open.spotify" in url else wide.getvalue()
+framefy.assets(ID)  # cached, like the collection below, for the UI checks further down
 two = (ID, "b" * 22)
 shown, img = framefy.poster(two, scale=0.1)
 assert shown["title"] == "Albums" and shown["artist"] == "2 albums" and shown["tracks"] == ["An Album — Some Artist"] * 2
@@ -153,6 +154,11 @@ for env, error in (({"JELLYFIN_USER": "nobody"}, ValueError), ({"JELLYFIN_API_KE
     except error:
         pass
 os.environ.update(JELLYFIN_API_KEY="key", JELLYFIN_USER="me")
+try:
+    framefy.parse_public(embed.replace(json.dumps(entity), "null").replace('"state"', '"status"'))
+    raise AssertionError("accepted a missing album")
+except ValueError:
+    pass
 
 # UI
 srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), framefy.UI)
@@ -162,7 +168,10 @@ home = urllib.request.urlopen(base + "/").read()
 assert b"<title>Framefy</title>" in home and b'id="jellyfin" type="button" >' in home  # shown: JELLYFIN_URL is set
 links = urllib.parse.quote(f"spotify:album:{ID} https://open.spotify.com/album/{'b' * 22} spotify:album:{ID}")
 assert json.loads(urllib.request.urlopen(f"{base}/search?q={links}").read()) == {"id": f"{ID},{'b' * 22}"}
-assert json.loads(urllib.request.urlopen(base + "/album?id=jellyfin").read())["title"] == "Favourites"
+for ids, albums in ((ID, 1), (",".join(two), 2)):  # albums: the names in the UI's selected list
+    assert json.loads(urllib.request.urlopen(f"{base}/album?id={ids}").read())["albums"] == ["An Album — Some Artist"] * albums
+shown = json.loads(urllib.request.urlopen(base + "/album?id=jellyfin").read())
+assert shown["title"] == "Favourites" and shown["albums"] == ["First — Band", "No Art"]
 assert urllib.request.urlopen(base + "/poster?id=jellyfin&preview=1&hide=artists").read()[:4] == b"\x89PNG"
 key = json.loads(urllib.request.urlopen(urllib.request.Request(base + "/upload", data=wide.getvalue())).read())["upload"]
 assert framefy.UPLOADS[key].size == (200, 200)

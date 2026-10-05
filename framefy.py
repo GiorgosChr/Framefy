@@ -26,7 +26,7 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 API = "https://api.spotify.com/v1"
 ALBUM_RE = re.compile(r"(?:open\.spotify\.com/(?:intl-\w+/)?album/|spotify:album:)([A-Za-z0-9]{22})")
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 FONT_DIR = Path(__file__).parent / "fonts"
 FONTS = {"montserrat": "Montserrat.ttf", "playfair": "PlayfairDisplay.ttf"}
 WEIGHTS = {"light": 500, "bold": 700, "black": 900}
@@ -158,7 +158,10 @@ def parse_public(embed_html, album_html=""):
     data = re.search(r'<script id="__NEXT_DATA__" type="application/json">(.*?)</script>', embed_html, re.S)
     if not data:
         raise RuntimeError("Spotify's public page has changed; add credentials to .env instead.")
-    e = json.loads(data.group(1))["props"]["pageProps"]["state"]["data"]["entity"]
+    props = json.loads(data.group(1))["props"]["pageProps"]
+    if "state" not in props:  # the embed page answers 200 for an album that does not exist
+        raise ValueError("Album not found on Spotify.")
+    e = props["state"]["data"]["entity"]
     date = re.search(r'name="music:release_date" content="([\d-]+)"', album_html)
     artist = re.search(r'name="music:musician" content="[^"]*/artist/(\w{22})"', album_html)
     return {
@@ -268,7 +271,8 @@ def mosaic(covers, side=2000):
 def collection(src, stamp=0):
     """(title, artist) of every album and a mosaic of their covers; src is a tuple of Spotify ids or "jellyfin"."""
     # ponytail: Jellyfin albums without art stay in the list but get no cell in the mosaic; a list too long
-    # for the page (roughly 100 albums on a portrait sheet) runs off it, so hide the tracks for those
+    # for the page (roughly 100 albums on a portrait sheet) runs off it, so hide the tracks for those;
+    # adding one album in the UI downloads every cover again, cache the cells per album if that gets slow
     jobs = favourites() if src == "jellyfin" else src
     if not jobs:
         raise ValueError("Jellyfin has no favourite albums.")
@@ -650,7 +654,8 @@ class UI(http.server.BaseHTTPRequestHandler):
                 bg, fg, strip, cols = palette(uploaded(q) or cover)
                 bg = options(q)["bg"] or bg
                 fg = readable(fg, bg)
-                self.json({"title": album["title"], "artist": album["artist"],  # colors: page theme
+                names = album["tracks"] if "date" not in album else [f"{album['title']} — {album['artist']}"]
+                self.json({"title": album["title"], "artist": album["artist"], "albums": names,  # colors: page theme
                            "colors": ["#%02x%02x%02x" % c for c in (bg, fg, *strip)],
                            "swatches": ["#%02x%02x%02x" % c for c in cols]})
             elif url.path == "/poster":
@@ -727,16 +732,21 @@ input::placeholder { color: var(--muted); }
 button, a { font: inherit; color: inherit; cursor: pointer; }
 :is(button, a, input):focus-visible { outline: 2px solid var(--fg); outline-offset: 4px; }
 #status { margin: 8px 0 0; color: var(--muted); min-height: 1.45em; }
-#results { margin: 0; padding: 0 0 0 1.6em; max-height: 34vh; overflow: auto; }
-#results li { padding: 3px 0; }
-#results button, #more, #jellyfin, .opts button { border: 0; background: none; padding: 0; text-align: left; }
-small, #more, #jellyfin, .opts button { color: var(--muted); font-size: 15px; }
+.lists { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr); gap: 20px; }
+#results, #picked ol { margin: 0; padding: 0 0 0 1.6em; max-height: 34vh; overflow: auto; }
+#results li, #picked li { padding: 3px 0; }
+#results button, #more, #jellyfin, #mode button, #picked button, .opts button { border: 0; background: none; padding: 0; text-align: left; }
+small, #more, #jellyfin, #mode button, #picked button, .opts button { color: var(--muted); font-size: 15px; }
+#mode { margin-top: 6px; }
+#picked button { margin-left: 8px; }
+#results button { vertical-align: top; }  /* keeps the number beside the first line of a wrapped result */
+#results:empty { display: none; }  /* leaves the whole width to the selected list */
 #more, #jellyfin { display: block; margin-top: 8px; text-decoration: underline; }
 body:not(.multi) .multi, body.multi .single { display: none; }
 .opts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px 30px; }
 .opts .wide { grid-column: 1 / -1; }
-.opts button { margin: 0 16px 4px 0; border-bottom: 3px solid transparent; }
-.opts button.on { color: var(--fg); border-bottom-color: var(--fg); }
+.opts button, #mode button { margin: 0 16px 4px 0; border-bottom: 3px solid transparent; }
+.opts button.on, #mode button.on { color: var(--fg); border-bottom-color: var(--fg); }
 .opts button.sw { width: 24px; height: 24px; margin-right: 8px; border: 2px solid var(--muted); vertical-align: middle; }
 .opts button.sw.on { outline: 2px solid var(--fg); outline-offset: 2px; }
 .opts input[type=color] { width: 30px; height: 26px; padding: 0; border: 0; background: none; vertical-align: middle; cursor: pointer; }
@@ -759,9 +769,13 @@ footer { display: flex; align-items: center; gap: 16px; color: var(--muted); fon
   <header><h1>Framefy</h1><h2>Posters from Spotify albums</h2></header>
   <form>
     <label for="q">Album</label>
+    <div id="mode"></div>
     <input id="q" placeholder="Spotify album link (or several), or a name to search" autocomplete="off" autofocus>
     <p id="status" role="status"></p>
-    <ol id="results"></ol>
+    <div class="lists">
+      <ol id="results"></ol>
+      <div id="picked" hidden><small>Selected</small><ol></ol></div>
+    </div>
     <button id="more" type="button" hidden>More results</button>
     <button id="jellyfin" type="button" __JELLYFIN__>Jellyfin favourites</button>
   </form>
@@ -777,7 +791,8 @@ const state = {id: '', size: 'A4', format: 'png', orientation: 'portrait', layou
   title: '', artist: '', caption: '', bg: '', fg: '', upload: ''};
 const hidden = new Set();   // poster parts switched off
 const marks = [];           // [button, isOn] pairs, repainted by mark()
-let album = null, query = '', offset = 0, timer;
+const names = {};           // album id -> "Title — Artist", for the selected list
+let album = null, query = '', offset = 0, timer, soon, many = false;   // many: picking adds to the selection
 
 const CHOICES = [
   ['Size', 'size', [['A5', 'A5'], ['A4', 'A4'], ['A3', 'A3'], ['A2', 'A2'], ['LETTER', 'Letter'], ['50X70', '50×70']], true],
@@ -865,7 +880,8 @@ group('Own cover', true, file, el('br'), remove);
 function paint() {   // colour swatches for the loaded cover
   for (const key of ['bg', 'fg']) {
     const div = swatches[key];
-    while (div.children.length > 1) { const b = div.lastChild; marks.splice(marks.findIndex(m => m[0] === b), 1); b.remove(); }
+    while (div.children.length > 1) { const b = div.lastChild, i = marks.findIndex(m => m[0] === b); if (i >= 0) marks.splice(i, 1); b.remove(); }
+    if (!album) continue;
     const after = key === 'bg' ? load : undefined;
     div.append(button('Auto', () => !state[key], () => { state[key] = ''; }, '', after));
     for (const c of album.swatches) {
@@ -883,12 +899,47 @@ function paint() {   // colour swatches for the loaded cover
   }
 }
 
+const picked = () => state.id && state.id !== 'jellyfin' ? state.id.split(',') : [];
+function listPicked() {   // the selected albums, next to the search results
+  const ids = picked();
+  $('#picked').hidden = !many && ids.length < 2;   // a mosaic keeps its list in One mode, to remove albums from
+  $('#picked ol').replaceChildren(...ids.map(id => {
+    const li = el('li', names[id] || '…'), x = el('button', '×');
+    x.type = 'button';
+    x.setAttribute('aria-label', 'Remove ' + (names[id] || 'album'));
+    x.onclick = () => choose(ids.filter(i => i !== id).join(','));
+    li.append(x);
+    return li;
+  }));
+}
+function take(ids) {   // Multiple adds to the selection, One replaces it
+  choose([...new Set([...(many ? picked() : []), ...ids])].join(','));
+}
+
 async function load() {
-  if (!state.id) return mark();
+  const id = state.id;
+  listPicked();
+  if (!id) {   // nothing selected (any more): back to the empty page
+    album = null;
+    state.bg = state.fg = '';
+    document.documentElement.removeAttribute('style');
+    paint();
+    say('');
+    document.querySelectorAll('[data-k=title], [data-k=artist]').forEach(i => { i.placeholder = ''; });
+    $('#preview').removeAttribute('src');
+    $('#download').removeAttribute('href');
+    $('.empty').hidden = false;
+    $('h1').textContent = 'Framefy';
+    $('h2').textContent = 'Posters from Spotify albums';
+    return mark();
+  }
   say('Loading…');
-  const a = await get('/album', {id: state.id, upload: state.upload, bg: state.bg});
+  const a = await get('/album', {id, upload: state.upload, bg: state.bg});
+  if (id !== state.id) return;   // superseded by a later pick
   if (a.error) return say(a.error);
   album = a;
+  picked().forEach((p, i) => { names[p] = a.albums[i]; });
+  listPicked();
   $('h1').textContent = a.title;
   $('h2').textContent = a.artist;
   document.querySelector('[data-k=title]').placeholder = a.title;
@@ -898,10 +949,13 @@ async function load() {
 }
 function choose(id) {
   state.id = id;
-  state.bg = state.fg = '';
+  if (!many) state.bg = state.fg = '';   // Multiple keeps the chosen colours while the selection changes
   document.body.classList.toggle('multi', id === 'jellyfin' || id.includes(','));
   location.hash = id;  // so a reload keeps the album
-  load();
+  listPicked();
+  if (id) say('Loading…');
+  clearTimeout(soon);
+  soon = setTimeout(load, id.includes(',') ? 600 : 0);   // quick picks in a row make one mosaic, not one each
 }
 $('#preview').onload = e => { e.target.classList.remove('busy'); $('.empty').hidden = true; say(''); };
 $('#preview').onerror = e => { e.target.classList.remove('busy'); say('Could not make the poster.'); };
@@ -913,13 +967,16 @@ async function find(more) {
   $('#more').hidden = true;
   const r = await get('/search', {q: query, offset});
   if (r.error) return say(r.error);
-  if (r.id) return choose(r.id);
+  if (r.id) {   // one or several links
+    if (many) $('#q').value = '';
+    return take(r.id.split(','));
+  }
   say(r.results.length || offset ? '' : 'No albums found.');
   for (const a of r.results) {
     const li = el('li'), b = el('button', a.title);
     b.type = 'button';
     b.append(el('small', ` ${a.artist} · ${a.year}`));
-    b.onclick = () => choose(a.id);
+    b.onclick = () => { names[a.id] = `${a.title} — ${a.artist}`; take([a.id]); };
     li.append(b);
     $('#results').append(li);
   }
@@ -929,6 +986,8 @@ async function find(more) {
 $('form').onsubmit = e => { e.preventDefault(); find(false); };
 $('#more').onclick = () => find(true);
 $('#jellyfin').onclick = () => choose('jellyfin');
+$('#mode').append(...[['One', false], ['Multiple', true]].map(([text, v]) =>
+  button(text, () => many === v, () => { many = v; }, '', () => { mark(); listPicked(); })));
 mark();
 if (location.hash) choose(location.hash.slice(1));
 </script>
